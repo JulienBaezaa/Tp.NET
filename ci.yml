@@ -1,0 +1,141 @@
+name: CI/CD
+
+# ---------- Bloc 1 : quand ----------
+on:
+  pull_request:
+    branches: [main, develop]      # PR : vérifications seulement
+  push:
+    branches: [main, develop]      # push develop : + déploiement
+
+# ---------- Bloc 5 : moindre privilège ----------
+permissions:
+  contents: read                   # lecture seule par défaut pour tous les jobs
+
+jobs:
+  # ---------- Bloc 2 : build + artefact versionné ----------
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet restore
+      - run: dotnet build -c Release --no-restore
+      - run: dotnet publish src/ProductCatalog.Api/ProductCatalog.Api.csproj -c Release -o publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-api-${{ github.run_number }}   # artefact versionné
+          path: publish/
+
+  # ---------- Bloc 3 : tests ----------
+  test:
+    needs: build                   # ne démarre que si build est OK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      # Tests unitaires MSTest + couverture de code
+      - run: dotnet test tests/ProductCatalog.Tests --logger trx --collect:"XPlat Code Coverage" --results-directory TestResults
+      # L'API doit tourner pour que Selenium ouvre Swagger
+      - name: Lancer l'API
+        run: |
+          dotnet run --project src/ProductCatalog.Api --urls http://localhost:8080 &
+          sleep 15
+      # Tests fonctionnels Selenium (Chrome est déjà installé sur ubuntu-latest)
+      - run: dotnet test tests/ProductCatalog.E2E --logger trx --results-directory TestResults
+      # Publication des résultats, même si un test échoue
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: TestResults/
+
+  # ---------- Bloc 7 : qualité ----------
+  quality:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # historique complet pour Sonar
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/setup-java@v4   # SonarScanner a besoin de Java
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: dotnet tool install --global dotnet-sonarscanner
+      - name: Analyse SonarQube
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          dotnet sonarscanner begin /k:"app-api" \
+            /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            /d:sonar.token="$SONAR_TOKEN" \
+            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" \
+            /d:sonar.qualitygate.wait=true
+          dotnet build
+          dotnet test --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollector.Configuration.Format=opencover
+          dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
+
+  # ---------- Bloc 5 : scan des dépendances ----------
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet restore
+      # Liste les packages NuGet avec une faille connue
+      - run: dotnet list package --vulnerable --include-transitive | tee vuln.txt
+      # Fait échouer le job si une faille est trouvée
+      - run: "! grep -q 'has the following vulnerable packages' vuln.txt"
+
+  # ---------- Bloc 2 (+ Trivy du Bloc 5) : déploiement staging ----------
+  deploy-staging:
+    needs: [quality, security]
+    if: github.ref == 'refs/heads/develop'   # seulement develop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write              # seul ce job peut publier une image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Connexion au registre Docker
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Construire et taguer l'image
+        run: docker build -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
+
+      - name: Scan de l'image avec Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'           # bloque si faille critique ou haute
+
+      - name: Publier l'image
+        run: docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Lancer le conteneur de staging
+        run: |
+          docker rm -f api-staging || true
+          docker run -d --name api-staging -p 8080:8080 \
+            -e ConnectionStrings__DefaultConnection="${{ secrets.STAGING_DB }}" \
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+  # ---------- Bloc 5 : analyse dynamique ----------
+  zap:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://staging.monapi.fr:8080'   # adresse du staging
