@@ -1,0 +1,127 @@
+// ============================================================
+// REFACTORING : code de base (AVANT) puis amélioration (APRÈS)
+// Noms et taux du corrigé : à adapter au vrai code.
+// ============================================================
+
+
+// ============================================================
+// AVANT (code de base)
+// ============================================================
+/*
+[HttpPost]
+public IActionResult Create(CreateProductRequest p)
+{
+    // 1. Validation mélangée au reste
+    if (p.Name == null || p.Name == "") return BadRequest("nom");
+    if (p.Price <= 0) return BadRequest("prix");
+
+    // 2. Calcul de remise : if imbriqués + nombres magiques
+    decimal r = 0;
+    if (p.Price >= 500) r = 0.15m;
+    else if (p.Price >= 200) r = 0.10m;
+    else if (p.Price >= 100) r = 0.05m;
+    if (p.Category == "accessoires") r = r + 0.05m;
+    else if (p.Category == "ecrans") { if (r > 0.10m) r = 0.10m; }
+    else if (p.Category != "autre") return BadRequest("cat");
+
+    // 3. Accès base de données directement dans le contrôleur
+    var prod = new Product { Name = p.Name, Price = p.Price, Category = p.Category,
+                             FinalPrice = p.Price * (1 - r) };
+    _db.Products.Add(prod);
+    _db.SaveChanges();
+    return CreatedAtAction(nameof(GetById), new { id = prod.Id }, prod);
+}
+
+DÉFAUTS :
+ - nombres magiques (0.15, 500...)
+ - if imbriqués
+ - noms vagues (p, r, prod)
+ - validation + calcul + base dans la même méthode
+*/
+
+
+// ============================================================
+// APRÈS (amélioration)
+// ============================================================
+
+// 1. Le calcul dans sa propre classe (avec une interface)
+public interface IDiscountCalculator
+{
+    decimal GetDiscountRate(decimal price, string category);
+}
+
+public class DiscountCalculator : IDiscountCalculator
+{
+    // constantes nommées à la place des nombres magiques
+    private const decimal SeuilBas = 100m;
+    private const decimal SeuilMoyen = 200m;
+    private const decimal SeuilHaut = 500m;
+    private const decimal BonusAccessoires = 0.05m;
+    private const decimal PlafondEcrans = 0.10m;
+
+    public decimal GetDiscountRate(decimal price, string category)
+    {
+        var baseRate = GetBaseRate(price);
+        return category switch
+        {
+            "accessoires" => baseRate + BonusAccessoires,
+            "ecrans"      => Math.Min(baseRate, PlafondEcrans),
+            _             => baseRate
+        };
+    }
+
+    private static decimal GetBaseRate(decimal price) => price switch
+    {
+        >= SeuilHaut  => 0.15m,
+        >= SeuilMoyen => 0.10m,
+        >= SeuilBas   => 0.05m,
+        _             => 0m
+    };
+}
+
+// 2. La validation sur le DTO
+public class CreateProductRequest
+{
+    [Required, StringLength(100)]
+    public string Name { get; set; } = "";
+
+    [Range(0.01, double.MaxValue)]
+    public decimal Price { get; set; }
+
+    [Required, RegularExpression("^(accessoires|ecrans|autre)$")]
+    public string Category { get; set; } = "";
+}
+
+// 3. Le contrôleur ne fait plus que recevoir et répondre
+[ApiController]                       // renvoie 400 automatiquement si le DTO est invalide
+[Route("api/products")]
+public class ProductsController : ControllerBase
+{
+    private readonly AppDbContext _db;
+    private readonly IDiscountCalculator _discount;
+
+    public ProductsController(AppDbContext db, IDiscountCalculator discount)
+    {
+        _db = db;
+        _discount = discount;
+    }
+
+    [HttpPost]
+    public IActionResult Create(CreateProductRequest request)
+    {
+        var rate = _discount.GetDiscountRate(request.Price, request.Category);
+        var product = new Product
+        {
+            Name = request.Name,
+            Price = request.Price,
+            Category = request.Category,
+            FinalPrice = Math.Round(request.Price * (1 - rate), 2)
+        };
+        _db.Products.Add(product);
+        _db.SaveChanges();
+        return CreatedAtAction(nameof(GetById), new { id = product.Id }, product);
+    }
+}
+
+// 4. Dans Program.cs
+// builder.Services.AddScoped<IDiscountCalculator, DiscountCalculator>();
