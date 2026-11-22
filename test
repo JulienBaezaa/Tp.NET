@@ -1,0 +1,124 @@
+// ============================================================
+// TESTS : tests de base (AVANT) puis amélioration (APRÈS)
+// Règles supposées (à remplacer par celles du vrai code) :
+//   remise 5 % dès 100, 10 % dès 200, 15 % dès 500
+//   accessoires : +5 %  |  écrans : plafonnés à 10 %  |  autre : règle normale
+// ============================================================
+
+
+// ============================================================
+// AVANT (tests de base : un seul test, cas nominal)
+// ============================================================
+/*
+[TestClass]
+public class ProductsControllerTests
+{
+    [TestMethod]
+    public void Create_ProduitValide_Retourne201()
+    {
+        var request = new CreateProductRequest { Name = "Hotte", Price = 50, Category = "autre" };
+
+        var result = _controller.Create(request);
+
+        Assert.IsInstanceOfType(result, typeof(CreatedAtActionResult));
+    }
+}
+
+MANQUES :
+ - pas de cas limites (seuils 100, 200, 500)
+ - pas de cas d'erreur (prix négatif, nom vide, catégorie inconnue)
+*/
+
+
+// ============================================================
+// APRÈS (amélioration)
+// ============================================================
+// Méthode : 1. noter les règles  2. faire le tableau de cas  3. une ligne = un [DataRow]
+//
+//   Cas                | Entrée                | Attendu
+//   Nominal            | 50, autre             | 201
+//   Limite sous 100    | 99,99, autre          | pas de remise
+//   Limite pile 100    | 100, autre            | 5 %  -> 95
+//   Limite pile 200    | 200, autre            | 10 % -> 180
+//   Limite pile 500    | 500, autre            | 15 % -> 425
+//   Accessoire         | 200, accessoires      | 10 % + 5 % -> 170
+//   Écran plafonné     | 500, ecrans           | 10 % max -> 450
+//   Erreur nom         | nom vide              | 400
+//   Erreur prix        | -10                   | 400
+//   Erreur catégorie   | "jardin"              | 400
+
+[TestClass]
+public class ProductsControllerTests
+{
+    private ProductsController _controller = null!;
+
+    [TestInitialize]
+    public void Setup()
+    {
+        // base en mémoire : chaque test part de zéro
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
+        _controller = new ProductsController(new AppDbContext(options), new DiscountCalculator());
+    }
+
+    // --- Cas nominal ---
+    [TestMethod]
+    public void Create_ProduitValide_Retourne201()
+    {
+        var request = new CreateProductRequest { Name = "Hotte", Price = 50, Category = "autre" };
+
+        var result = _controller.Create(request);
+
+        Assert.IsInstanceOfType(result, typeof(CreatedAtActionResult));
+    }
+
+    // --- Cas limites : les seuils de remise ---
+    [TestMethod]
+    [DataRow(99.99, 99.99)]    // juste sous 100 : pas de remise
+    [DataRow(100.0, 95.0)]     // 100 : 5 %
+    [DataRow(200.0, 180.0)]    // 200 : 10 %
+    [DataRow(500.0, 425.0)]    // 500 : 15 %
+    public void Create_SeuilsDeRemise(double prix, double prixAttendu)
+    {
+        var product = CreerProduit((decimal)prix, "autre");
+
+        Assert.AreEqual((decimal)prixAttendu, product.FinalPrice);
+    }
+
+    // --- Règles par catégorie ---
+    [TestMethod]
+    public void Create_Accessoire_RemiseEnPlus()
+        => Assert.AreEqual(170m, CreerProduit(200, "accessoires").FinalPrice);   // 10 % + 5 %
+
+    [TestMethod]
+    public void Create_Ecran_RemisePlafonnee()
+        => Assert.AreEqual(450m, CreerProduit(500, "ecrans").FinalPrice);        // 10 % max
+
+    // --- Cas d'erreur : on teste la validation du DTO ---
+    [TestMethod]
+    [DataRow("",      50.0,  "autre")]    // nom vide
+    [DataRow("Hotte", -10.0, "autre")]    // prix négatif
+    [DataRow("Hotte", 50.0,  "jardin")]   // catégorie inconnue
+    public void Validation_DonneesInvalides_EstRefusee(string nom, double prix, string categorie)
+    {
+        var request = new CreateProductRequest { Name = nom, Price = (decimal)prix, Category = categorie };
+        var erreurs = new List<ValidationResult>();
+
+        var valide = Validator.TryValidateObject(
+            request, new ValidationContext(request), erreurs, validateAllProperties: true);
+
+        Assert.IsFalse(valide);   // [ApiController] renvoie alors 400
+    }
+
+    // --- Méthode utilitaire ---
+    private Product CreerProduit(decimal prix, string categorie)
+    {
+        var request = new CreateProductRequest { Name = "Test", Price = prix, Category = categorie };
+        var result = (CreatedAtActionResult)_controller.Create(request);
+        return (Product)result.Value!;
+    }
+}
+
+// POURQUOI C'EST SUFFISANT :
+// chaque seuil, chaque catégorie et chaque règle de validation a au moins un test.
+// Si une règle change par erreur (ex : >= devient >), un test échoue et le pipeline bloque.
